@@ -12,7 +12,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out slipstream-rust
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -51,7 +51,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - name: Check out slipstream-rust
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -76,7 +76,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Check out slipstream-rust
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
@@ -92,7 +92,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out slipstream-rust
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -109,75 +109,419 @@ jobs:
           PICOQUIC_BUILD_DIR: .picoquic-build/minimal
         run: cargo clippy -p slipstream-client -p slipstream-server --features openssl-vendored,picoquic-minimal-build -- -D warnings
 
-  build-binaries:
-    name: Build Binaries (${{ matrix.name }})
-    runs-on: ${{ matrix.runner }}
+  build-linux:
+    name: Build Linux
+    runs-on: ubuntu-latest
     timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: macos-arm64
-            runner: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: slipstream-macos-arm64
-          - name: linux-x86_64
-            runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact_name: slipstream-linux-x86_64
+    permissions:
+      contents: read
     steps:
       - name: Check out slipstream-rust
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
-      - name: Install build dependencies (Linux)
-        if: runner.os == 'Linux'
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake pkg-config libssl-dev python3
-
-      - name: Install build dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install cmake pkg-config openssl@3
-          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
-          echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
+          sudo apt-get install -y cmake pkg-config libssl-dev
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-unknown-linux-gnu
 
-      - name: Build slipstream-client
-        run: cargo build -p slipstream-client --release --target ${{ matrix.target }}
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: build-linux
+          cache-on-failure: "true"
 
-      - name: Build slipstream-server
-        run: cargo build -p slipstream-server --release --target ${{ matrix.target }}
+      - name: Build release binaries
+        run: |
+          cargo build -p slipstream-client --release --target x86_64-unknown-linux-gnu
+          cargo build -p slipstream-server --release --target x86_64-unknown-linux-gnu
 
       - name: Package binaries
         shell: bash
+        env:
+          ARTIFACT_NAME: slipstream-linux-x86_64
+          TARGET_TRIPLE: x86_64-unknown-linux-gnu
+          BIN_EXT: ""
         run: |
           set -euo pipefail
-          dist_dir="dist"
-          base_name="${{ matrix.artifact_name }}"
-          bin_dir="target/${{ matrix.target }}/release"
+          dist_dir="dist/${ARTIFACT_NAME}"
+          bin_dir="target/${TARGET_TRIPLE}/release"
           mkdir -p "${dist_dir}"
-          cp "${bin_dir}/slipstream-client" "${dist_dir}/"
-          cp "${bin_dir}/slipstream-server" "${dist_dir}/"
-          if command -v sha256sum >/dev/null 2>&1; then
-            (cd "${dist_dir}" && sha256sum slipstream-client slipstream-server > "${base_name}.sha256")
-          else
-            (cd "${dist_dir}" && shasum -a 256 slipstream-client slipstream-server > "${base_name}.sha256")
-          fi
+          cp "${bin_dir}/slipstream-client${BIN_EXT}" "${dist_dir}/"
+          cp "${bin_dir}/slipstream-server${BIN_EXT}" "${dist_dir}/"
+          (
+            cd "${dist_dir}"
+            sha256sum "slipstream-client${BIN_EXT}" "slipstream-server${BIN_EXT}" > SHA256SUMS
+          )
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: |
-            dist/*
+          name: slipstream-linux-x86_64
+          path: dist/slipstream-linux-x86_64
           if-no-files-found: error
+
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+    timeout-minutes: 50
+    permissions:
+      contents: read
+    steps:
+      - name: Preserve LF line endings for shell scripts
+        run: git config --global core.autocrlf input
+
+      - name: Check out slipstream-rust
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install MinGW build dependencies
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          path-type: inherit
+          update: true
+          install: >-
+            make
+            perl
+            nasm
+          pacboy: >-
+            toolchain:p
+            cmake:p
+            ninja:p
+            pkgconf:p
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: build-windows-gnu
+          cache-on-failure: "true"
+
+      - name: Bootstrap OpenSSL and build release binaries
+        shell: msys2 {0}
+        env:
+          AR: ar
+          CC: gcc
+          CXX: g++
+          CMAKE_GENERATOR: Ninja
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: gcc
+        run: |
+          set -euo pipefail
+          bootstrap_dir="$(mktemp -d)"
+          mkdir -p "${bootstrap_dir}/src"
+          cat > "${bootstrap_dir}/Cargo.toml" <<'EOF'
+          [package]
+          name = "openssl-bootstrap"
+          version = "0.1.0"
+          edition = "2021"
+
+          [dependencies]
+          openssl-sys = { version = "=0.9.111", features = ["vendored"] }
+          EOF
+          printf '%s\n' 'fn main() {}' > "${bootstrap_dir}/src/main.rs"
+          cargo build \
+            --manifest-path "${bootstrap_dir}/Cargo.toml" \
+            --release \
+            --target x86_64-pc-windows-gnu \
+            --target-dir "${bootstrap_dir}/target"
+          output_file="$(find "${bootstrap_dir}/target/x86_64-pc-windows-gnu/release/build" -path '*openssl-sys-*/output' | head -n 1)"
+          [[ -n "${output_file}" ]]
+          root_dir="$(sed -n 's/^cargo:root=//p' "${output_file}" | tail -n 1)"
+          include_dir="$(sed -n 's/^cargo:include=//p' "${output_file}" | tail -n 1)"
+          ssl_lib=""
+          crypto_lib=""
+          for candidate in \
+            "${root_dir}/lib/libssl.a" \
+            "${root_dir}/lib64/libssl.a" \
+            "${root_dir}/lib/libssl.dll.a" \
+            "${root_dir}/lib64/libssl.dll.a"
+          do
+            if [[ -f "${candidate}" ]]; then
+              ssl_lib="${candidate}"
+              break
+            fi
+          done
+          for candidate in \
+            "${root_dir}/lib/libcrypto.a" \
+            "${root_dir}/lib64/libcrypto.a" \
+            "${root_dir}/lib/libcrypto.dll.a" \
+            "${root_dir}/lib64/libcrypto.dll.a"
+          do
+            if [[ -f "${candidate}" ]]; then
+              crypto_lib="${candidate}"
+              break
+            fi
+          done
+          [[ -n "${root_dir}" && -n "${ssl_lib}" && -n "${crypto_lib}" ]]
+          export OPENSSL_NO_VENDOR=1
+          export OPENSSL_DIR="${root_dir}"
+          export OPENSSL_ROOT_DIR="${root_dir}"
+          export OPENSSL_LIB_DIR="$(dirname "${ssl_lib}")"
+          export OPENSSL_INCLUDE_DIR="${include_dir:-${root_dir}/include}"
+          export OPENSSL_SSL_LIBRARY="${ssl_lib}"
+          export OPENSSL_CRYPTO_LIBRARY="${crypto_lib}"
+          export OPENSSL_USE_STATIC_LIBS=TRUE
+          export CARGO_FEATURE_PICOQUIC_MINIMAL_BUILD=1
+          export PICOQUIC_AUTO_BUILD=0
+          export PICOQUIC_BUILD_DIR=".picoquic-build/windows-gnu-minimal"
+          bash ./scripts/build_picoquic.sh
+          cargo build -p slipstream-client --release --target x86_64-pc-windows-gnu --features openssl-vendored
+          cargo build -p slipstream-server --release --target x86_64-pc-windows-gnu --features openssl-vendored
+
+      - name: Package binaries
+        shell: msys2 {0}
+        env:
+          ARTIFACT_NAME: slipstream-windows-x86_64
+          TARGET_TRIPLE: x86_64-pc-windows-gnu
+          BIN_EXT: .exe
+        run: |
+          set -euo pipefail
+          dist_dir="dist/${ARTIFACT_NAME}"
+          bin_dir="target/${TARGET_TRIPLE}/release"
+          mkdir -p "${dist_dir}"
+          cp "${bin_dir}/slipstream-client${BIN_EXT}" "${dist_dir}/"
+          cp "${bin_dir}/slipstream-server${BIN_EXT}" "${dist_dir}/"
+          (
+            cd "${dist_dir}"
+            sha256sum "slipstream-client${BIN_EXT}" "slipstream-server${BIN_EXT}" > SHA256SUMS
+          )
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: slipstream-windows-x86_64
+          path: dist/slipstream-windows-x86_64
+          if-no-files-found: error
+
+  build-android:
+    name: Build Android
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      contents: read
+    steps:
+      - name: Check out slipstream-rust
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build perl make
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Set up Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: build-android-aarch64
+          cache-on-failure: "true"
+
+      - name: Bootstrap OpenSSL and build release binaries
+        env:
+          ANDROID_ABI: arm64-v8a
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_PLATFORM: 21
+          CMAKE_GENERATOR: Ninja
+        run: |
+          set -euo pipefail
+          toolchain="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC="${toolchain}/aarch64-linux-android21-clang"
+          export CXX="${toolchain}/aarch64-linux-android21-clang++"
+          export AR="${toolchain}/llvm-ar"
+          export RANLIB="${toolchain}/llvm-ranlib"
+          export CC_aarch64_linux_android="${CC}"
+          export CXX_aarch64_linux_android="${CXX}"
+          export AR_aarch64_linux_android="${AR}"
+          export RANLIB_aarch64_linux_android="${RANLIB}"
+          export RUST_ANDROID_GRADLE_CC="${CC}"
+          export RUST_ANDROID_GRADLE_AR="${AR}"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${CC}"
+          bootstrap_dir="$(mktemp -d)"
+          mkdir -p "${bootstrap_dir}/src"
+          cat > "${bootstrap_dir}/Cargo.toml" <<'EOF'
+          [package]
+          name = "openssl-bootstrap"
+          version = "0.1.0"
+          edition = "2021"
+
+          [dependencies]
+          openssl-sys = { version = "=0.9.111", features = ["vendored"] }
+          EOF
+          printf '%s\n' 'fn main() {}' > "${bootstrap_dir}/src/main.rs"
+          cargo build \
+            --manifest-path "${bootstrap_dir}/Cargo.toml" \
+            --release \
+            --target aarch64-linux-android \
+            --target-dir "${bootstrap_dir}/target"
+          output_file="$(find "${bootstrap_dir}/target/aarch64-linux-android/release/build" -path '*openssl-sys-*/output' | head -n 1)"
+          [[ -n "${output_file}" ]]
+          root_dir="$(sed -n 's/^cargo:root=//p' "${output_file}" | tail -n 1)"
+          include_dir="$(sed -n 's/^cargo:include=//p' "${output_file}" | tail -n 1)"
+          ssl_lib=""
+          crypto_lib=""
+          for candidate in "${root_dir}/lib/libssl.a" "${root_dir}/lib64/libssl.a"; do
+            if [[ -f "${candidate}" ]]; then
+              ssl_lib="${candidate}"
+              break
+            fi
+          done
+          for candidate in "${root_dir}/lib/libcrypto.a" "${root_dir}/lib64/libcrypto.a"; do
+            if [[ -f "${candidate}" ]]; then
+              crypto_lib="${candidate}"
+              break
+            fi
+          done
+          [[ -n "${root_dir}" && -n "${ssl_lib}" && -n "${crypto_lib}" ]]
+          export OPENSSL_NO_VENDOR=1
+          export OPENSSL_DIR="${root_dir}"
+          export OPENSSL_ROOT_DIR="${root_dir}"
+          export OPENSSL_LIB_DIR="$(dirname "${ssl_lib}")"
+          export OPENSSL_INCLUDE_DIR="${include_dir:-${root_dir}/include}"
+          export OPENSSL_SSL_LIBRARY="${ssl_lib}"
+          export OPENSSL_CRYPTO_LIBRARY="${crypto_lib}"
+          export OPENSSL_USE_STATIC_LIBS=TRUE
+          export CARGO_FEATURE_PICOQUIC_MINIMAL_BUILD=1
+          export PICOQUIC_AUTO_BUILD=0
+          export PICOQUIC_BUILD_DIR=".picoquic-build/android-aarch64-minimal"
+          export PICOQUIC_TARGET="aarch64-linux-android"
+          bash ./scripts/build_picoquic.sh
+          cargo build -p slipstream-client --release --target aarch64-linux-android --features openssl-vendored
+          cargo build -p slipstream-server --release --target aarch64-linux-android --features openssl-vendored
+
+      - name: Package binaries
+        shell: bash
+        env:
+          ARTIFACT_NAME: slipstream-android-aarch64
+          TARGET_TRIPLE: aarch64-linux-android
+          BIN_EXT: ""
+        run: |
+          set -euo pipefail
+          dist_dir="dist/${ARTIFACT_NAME}"
+          bin_dir="target/${TARGET_TRIPLE}/release"
+          mkdir -p "${dist_dir}"
+          cp "${bin_dir}/slipstream-client${BIN_EXT}" "${dist_dir}/"
+          cp "${bin_dir}/slipstream-server${BIN_EXT}" "${dist_dir}/"
+          (
+            cd "${dist_dir}"
+            sha256sum "slipstream-client${BIN_EXT}" "slipstream-server${BIN_EXT}" > SHA256SUMS
+          )
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: slipstream-android-aarch64
+          path: dist/slipstream-android-aarch64
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - build-linux
+      - build-windows
+      - build-android
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: slipstream-*
+          path: release-input
+
+      - name: Bundle release assets
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y zip
+          mkdir -p release-assets
+          shopt -s nullglob
+          for dir in release-input/*; do
+            if [[ ! -d "${dir}" ]]; then
+              continue
+            fi
+            name="$(basename "${dir}")"
+            if [[ "${name}" == slipstream-windows-* ]]; then
+              (
+                cd release-input
+                zip -rq "../release-assets/${name}.zip" "${name}"
+              )
+              sha256sum "release-assets/${name}.zip" > "release-assets/${name}.sha256"
+            else
+              (
+                cd release-input
+                tar -czf "../release-assets/${name}.tar.gz" "${name}"
+              )
+              sha256sum "release-assets/${name}.tar.gz" > "release-assets/${name}.sha256"
+            fi
+          done
+          test -n "$(find release-assets -maxdepth 1 -type f | head -n 1)"
+
+      - name: Prepare release metadata
+        id: release-meta
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::7}"
+          branch="${GITHUB_REF_NAME}"
+          tag="auto-${branch}-${short_sha}"
+          title="Automated build ${branch} ${short_sha}"
+          {
+            echo "tag=${tag}"
+            echo "title=${title}"
+            echo "notes<<EOF"
+            echo "Automated release for commit ${GITHUB_SHA} on ${branch}."
+            echo
+            echo "Run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "Commit: https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Create or update GitHub release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_NOTES: ${{ steps.release-meta.outputs.notes }}
+          RELEASE_TAG: ${{ steps.release-meta.outputs.tag }}
+          RELEASE_TITLE: ${{ steps.release-meta.outputs.title }}
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find release-assets -maxdepth 1 -type f | sort)
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" \
+              --title "${RELEASE_TITLE}" \
+              --notes "${RELEASE_NOTES}"
+            gh release upload "${RELEASE_TAG}" "${files[@]}" --clobber
+          else
+            gh release create "${RELEASE_TAG}" "${files[@]}" \
+              --target "${GITHUB_SHA}" \
+              --title "${RELEASE_TITLE}" \
+              --notes "${RELEASE_NOTES}"
+          fi
 
   interop:
     name: Interop (${{ matrix.name }})
@@ -204,13 +548,13 @@ jobs:
             client_domain: "tunnel.example.com"
     steps:
       - name: Check out slipstream-rust
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
       # C repo interop disabled (C repo currently broken).
       # - name: Check out C slipstream
-      #   uses: actions/checkout@v4
+      #   uses: actions/checkout@v6
       #   with:
       #     repository: EndPositive/slipstream
       #     path: slipstream-c
@@ -270,14 +614,14 @@ jobs:
           #   needs_c: true
     steps:
       - name: Check out slipstream-rust
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
       # C repo benchmark disabled (C repo currently broken).
       # - name: Check out C slipstream
       #   if: matrix.needs_c
-      #   uses: actions/checkout@v4
+      #   uses: actions/checkout@v6
       #   with:
       #     repository: EndPositive/slipstream
       #     path: slipstream-c
@@ -316,7 +660,7 @@ jobs:
     timeout-minutes: 40
     steps:
       - name: Check out slipstream-rust
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
